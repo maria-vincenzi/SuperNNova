@@ -227,6 +227,22 @@ def get_args():
         help="Bit list to mask (supports only powers of 2)",
     )
     parser.add_argument(
+        "--time_bin_dt",
+        type=float,
+        default=1.0,
+        help="Width (days) of the time bins used to group observations "
+        "(upstream SuperNNova: 0.33)",
+    )
+    parser.add_argument(
+        "--time_bin_method",
+        type=str,
+        default="weighted_mean",
+        choices=["weighted_mean", "min_err"],
+        help="How to combine several points of the same filter in a time bin: "
+        "inverse-variance weighted mean, or keep the smallest-error point "
+        "(upstream SuperNNova)",
+    )
+    parser.add_argument(
         "--redshift_label",
         type=str,
         default="none",

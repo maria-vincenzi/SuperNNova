@@ -645,7 +645,9 @@ def pivot_dataframe_single_from_df(df, settings):
     and each row in the dataframe will show a value for each of the flux and flux
     error column
 
-    - All observations withing 8 hours of each other are assigned the same MJD
+    - Observations within ``settings.time_bin_dt`` (default 1 day) of the first
+      observation of a bin are assigned the same MJD; per filter, they are
+      combined with an inverse-variance weighted mean (``time_bin_method``)
     - Results are cached with pickle
 
     Args:
@@ -657,31 +659,71 @@ def pivot_dataframe_single_from_df(df, settings):
 
     assert len(list_filters) > 0
 
-    arr_MJD = df.MJD.values
-    arr_delta_time = df.delta_time.values
-    # Loop over times to create grouped MJD:
-    # if filters are acquired within less than 0.33 MJD (~8 hours) of each other
-    # they get assigned the same time
-    min_dt = 0.33
-    time_last_change = 0
-    arr_grouped_MJD = np.zeros_like(arr_MJD)
-    for i in range(len(df)):
-        time = arr_MJD[i]
-        dt = arr_delta_time[i]
-        # 2 possibilities to update the time
-        # dt == 0 (it"s a new light curve)
-        # time - time_last_change > min_dt
-        if dt == 0 or (time - time_last_change) > min_dt:
-            arr_grouped_MJD[i] = time
-            time_last_change = time
-        else:
-            arr_grouped_MJD[i] = arr_grouped_MJD[i - 1]
-    # Add grouped delta time to dataframe
-    df["grouped_MJD"] = np.array(arr_grouped_MJD)
+    # ------------------------------------------------------------------
+    # Time binning (modified from upstream SuperNNova)
+    #
+    # Upstream: points within 0.33 d of the first point of a group share a
+    # time step, and per filter only the point with the smallest FLUXCALERR
+    # is kept.
+    #
+    # Here: the bin width is settings.time_bin_dt (default 1 day) and, per
+    # filter, the points in a bin are combined with an inverse-variance
+    # weighted mean:
+    #     FLUXCAL    = sum(w * f) / sum(w),   w = 1 / FLUXCALERR**2
+    #     FLUXCALERR = 1 / sqrt(sum(w))
+    # Bins are anchored on the first point of each bin (as upstream): a new
+    # bin starts at the first point more than time_bin_dt after the current
+    # bin's first point, or at the start of a new light curve. The time of a
+    # bin is the MJD of its first point (as upstream).
+    #
+    # Upstream behaviour is recovered with
+    #     --time_bin_dt 0.33 --time_bin_method min_err
+    # ------------------------------------------------------------------
+    bin_dt = float(getattr(settings, "time_bin_dt", 1.0))
+    bin_method = getattr(settings, "time_bin_method", "weighted_mean")
+    if bin_method not in ("weighted_mean", "min_err"):
+        raise ValueError(f"Unknown time_bin_method {bin_method}")
 
-    # Some filters (i, r, g, z) may appear multiple times with the same grouped MJD within same light curve
-    # When this happens, we select the one with lowest FLUXCALERR
-    df = df.sort_values("FLUXCALERR").groupby(["SNID", "grouped_MJD", "FLT"]).first()
+    # light curves must be contiguous and time-ordered (stable sort keeps
+    # the upstream order when it already is)
+    df = df.sort_values(["SNID", "MJD"], kind="mergesort")
+
+    arr_MJD = df["MJD"].values
+    arr_SNID = (
+        df["SNID"].values if "SNID" in df.columns else df.index.get_level_values("SNID").values
+    )
+    arr_grouped_MJD = np.zeros_like(arr_MJD)
+    anchor = None
+    for i in range(len(arr_MJD)):
+        new_lc = i == 0 or arr_SNID[i] != arr_SNID[i - 1]
+        if new_lc or (arr_MJD[i] - anchor) > bin_dt:
+            anchor = arr_MJD[i]
+        arr_grouped_MJD[i] = anchor
+    df["grouped_MJD"] = arr_grouped_MJD
+
+    group_keys = ["SNID", "grouped_MJD", "FLT"]
+
+    if bin_method == "weighted_mean":
+        bad_err = ~(df["FLUXCALERR"].values > 0)
+        if bad_err.any():
+            logging_utils.print_yellow(
+                f"Dropping {bad_err.sum()} points with FLUXCALERR <= 0 or NaN "
+                "(cannot be inverse-variance weighted)"
+            )
+            df = df[~bad_err]
+        df["_w"] = 1.0 / df["FLUXCALERR"].astype(np.float64) ** 2
+        df["_wf"] = df["_w"] * df["FLUXCAL"].astype(np.float64)
+        sums = df.groupby(group_keys)[["_w", "_wf"]].sum()
+        # every other column (header info, targets, ...) is constant within a
+        # bin or irrelevant; take it from the smallest-error point as upstream
+        df = df.sort_values("FLUXCALERR").groupby(group_keys).first()
+        df = df.drop(columns=["_w", "_wf"])
+        sums = sums.loc[df.index]
+        df["FLUXCAL"] = (sums["_wf"] / sums["_w"]).values
+        df["FLUXCALERR"] = (1.0 / np.sqrt(sums["_w"])).values
+    else:
+        # upstream: keep the point with the lowest FLUXCALERR
+        df = df.sort_values("FLUXCALERR").groupby(group_keys).first()
     # We then reset the index
     df = df.reset_index()
     # Compute PEAKMJDNORM = PEAKMJD in days since the start of the light curve
